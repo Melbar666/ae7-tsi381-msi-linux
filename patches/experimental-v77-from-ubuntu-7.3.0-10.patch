@@ -1,0 +1,588 @@
+--- a/sound/hda/controllers/intel.c
++++ b/sound/hda/controllers/intel.c
+@@ -114,6 +114,14 @@
+ static int jackpoll_ms[SNDRV_CARDS];
+ static int single_cmd = -1;
+ static int enable_msi = -1;
++static bool ae7_tsi381_msi = true;
++static bool ae7_tsi381_intx_fallback_diag;
++module_param(ae7_tsi381_msi, bool, 0444);
++module_param(ae7_tsi381_intx_fallback_diag, bool, 0444);
++MODULE_PARM_DESC(ae7_tsi381_intx_fallback_diag,
++                 "EXPERIMENTAL one-time in-stream MSI4->INTx fallback test, default off");
++MODULE_PARM_DESC(ae7_tsi381_msi,
++                 "AE-7 Tsi381 MSI4 bridge on exact [1102:0010/0081] only, default on");
+ #ifdef CONFIG_SND_HDA_PATCH_LOADER
+ static char *patch[SNDRV_CARDS];
+ #endif
+@@ -623,6 +631,15 @@
+ 	int ok;
+ 
+ 	ok = azx_position_ok(chip, azx_dev);
++    /* Passive event classification; ALSA callback and timing unchanged. */
++    if (READ_ONCE(istream->hda->tsi381_diag_enabled)) {
++        if (ok > 0)
++            atomic64_inc(&istream->hda->tsi381_pos_ok);
++        else if (ok == 0)
++            atomic64_inc(&istream->hda->tsi381_pos_deferred);
++        else
++            atomic64_inc(&istream->hda->tsi381_pos_skipped);
++    }
+ 	if (ok == 1) {
+ 		istream->irq_pending = false;
+ 		return ok;
+@@ -733,6 +750,9 @@
+ 	struct hdac_bus *bus = azx_bus(chip);
+ 	int ok;
+ 
++    if (READ_ONCE(hda->tsi381_diag_enabled)) {
++        atomic64_inc(&hda->tsi381_irq_defer_work);
++    }
+ 	if (!hda->irq_pending_warned) {
+ 		dev_info(chip->card->dev,
+ 			 "IRQ timing workaround is activated for card #%d. Suggest a bigger bdl_pos_adj.\n",
+@@ -789,6 +809,456 @@
+ 	}
+ }
+ 
++/*
++ * AE-7 is a conventional PCI endpoint behind a Tsi381 PCIe/PCI bridge.
++ * The bridge maps INTA to MSI source 4, NOT source 0. Allocate ALL eight
++ * vectors and register the HDA handler on pci_irq_vector(bridge, 4).
++ *
++ * The original endpoint legacy INTx IRQ stays registered throughout this
++ * experiment. Conversion is enabled ONLY AFTER snd_card_register(), not
++ * during early HDA codec discovery. On teardown, undo the hardware
++ * converter BEFORE freeing the bridge MSI4 IRQ, while INTx is still live.
++ */
++#define AE7_TSI381_CTRL 0x220
++#define AE7_TSI381_GPIO_CTRL 0x214
++#define AE7_TSI381_MSI_MASK 0x090
++#define AE7_TSI381_MSI_PENDING 0x094
++#define AE7_TSI381_MSI_CONTROL 0x082
++#define AE7_TSI381_INTA_VECTOR 4
++#define AE7_TSI381_MSI_VECTORS 8
++
++static bool ae7_tsi381_target(struct pci_dev *pdev)
++{
++    return pci_domain_nr(pdev->bus) == 0 &&
++           pdev->bus->number == 8 && pdev->devfn == PCI_DEVFN(0, 0) &&
++           pdev->vendor == 0x1102 && pdev->device == 0x0010 &&
++           pdev->subsystem_vendor == 0x1102 &&
++           pdev->subsystem_device == 0x0081;
++}
++
++
++/*
++ * Diagnostic-only, bounded driver-MMIO sampling, no register modifications.
++ * The mapped HDA BAR0 is read by its owning kernel driver; thus no
++ * userspace PCI resource0 mmap blocked by Secure Boot lockdown integrity.
++ * The work is canceled before azx_free() unmaps HDA MMIO.
++ */
++#define AE7_TSI381_DIAG_SAMPLES 90
++#define AE7_TSI381_DIAG_PERIOD_MS 2000
++
++/* Called from the diagnostic workqueue, never from hard IRQ context. */
++static void ae7_tsi381_release_irq(struct azx *chip);
++
++static void ae7_tsi381_diag_work(struct work_struct *work)
++{
++    struct hda_intel *hda =
++        container_of(to_delayed_work(work), struct hda_intel, tsi381_diag_work);
++    struct azx *chip = &hda->chip;
++    struct hdac_bus *bus = azx_bus(chip);
++    struct hdac_stream *stream;
++    struct pci_dev *bridge = hda->tsi381_bridge;
++    u32 ctrl = ~0U, mask = ~0U, pending = ~0U;
++    u32 intsts, intctl, wallclk;
++    int rc_ctrl, rc_mask, rc_pending;
++    unsigned int sample;
++
++    if (!READ_ONCE(hda->tsi381_diag_enabled) ||
++        !chip->running || !bus->chip_init || !bridge)
++        return;
++
++    /* No writes, wakeups, IRQ acknowledgments, or resets. */
++    intsts = azx_readl(chip, INTSTS);
++    intctl = azx_readl(chip, INTCTL);
++    wallclk = azx_readl(chip, WALLCLK);
++    rc_ctrl = pci_read_config_dword(bridge, AE7_TSI381_CTRL, &ctrl);
++    rc_mask = pci_read_config_dword(bridge, AE7_TSI381_MSI_MASK, &mask);
++    rc_pending = pci_read_config_dword(bridge, AE7_TSI381_MSI_PENDING, &pending);
++    sample = ++hda->tsi381_diag_sample;
++
++    dev_info(&chip->pci->dev,
++             "V71D sample=%u intsts=%08x intctl=%08x wallclk=%08x bridge_ctrl=%08x mask=%08x pending=%08x rc=%d,%d,%d\n",
++             sample, intsts, intctl, wallclk, ctrl, mask, pending,
++             rc_ctrl, rc_mask, rc_pending);
++
++    dev_info(&chip->pci->dev,
++             "V72I sample=%u irq_enter=%lld irq_handled=%lld irq_none=%lld intsts_s4=%lld intsts_ctrl=%lld intsts_empty=%lld sd_complete=%lld sd_error=%lld pos_ok=%lld pos_deferred=%lld pos_skipped=%lld work_entry=%lld bdl_adj=%d\
++",
++             sample,
++             (long long)atomic64_read(&hda->tsi381_irq_enter),
++             (long long)atomic64_read(&hda->tsi381_irq_handled),
++             (long long)atomic64_read(&hda->tsi381_irq_none),
++             (long long)atomic64_read(&hda->tsi381_irq_intsts_s4),
++             (long long)atomic64_read(&hda->tsi381_irq_intsts_ctrl),
++             (long long)atomic64_read(&hda->tsi381_irq_intsts_empty),
++             (long long)atomic64_read(&hda->tsi381_irq_sd_complete),
++             (long long)atomic64_read(&hda->tsi381_irq_sd_errors),
++             (long long)atomic64_read(&hda->tsi381_pos_ok),
++             (long long)atomic64_read(&hda->tsi381_pos_deferred),
++             (long long)atomic64_read(&hda->tsi381_pos_skipped),
++             (long long)atomic64_read(&hda->tsi381_irq_defer_work),
++             chip->bdl_pos_adj);
++
++    list_for_each_entry(stream, &bus->stream_list, list) {
++        if (stream->index != 4 && !stream->running)
++            continue;
++        if (stream->index == 4 && stream->running && stream->bdl.area &&
++            stream->frags > 0 && stream->frags <= AZX_MAX_BDL_ENTRIES) {
++            const __le32 *bdl = (const __le32 *)stream->bdl.area;
++            unsigned int i, ioc = 0;
++            for (i = 0; i < stream->frags; i++)
++                if (le32_to_cpu(READ_ONCE(bdl[4*i+3])) & 1)
++                    ioc++;
++            dev_info(&chip->pci->dev,
++                     "V72B sample=%u stream=4 bdl_frags=%u ioc=%u\n",
++                     sample, stream->frags, ioc);
++            /*
++             * V75 diagnostic: correlate the actual HDA stream's ALSA
++             * no_period_wakeup flag with the programmed IOC count.
++             * Stream metadata only; no additional hardware accesses,
++             * write to DMA descriptors, mixer or PCI configuration.
++             */
++            dev_info(&chip->pci->dev,
++                     "V75W sample=%u stream=4 no_period_wakeup=%u period_bytes=%u buffer_bytes=%u ioc=%u\n",
++                     sample, (unsigned int)stream->no_period_wakeup,
++                     stream->period_bytes, stream->bufsize, ioc);
++            /*
++             * V76 alias-safe read-only DMA diagnostic. The 49,152-byte
++             * S32_LE/48 kHz/2ch period loops in 128 ms; V71's 2048-ms
++             * snapshots alias at exactly sixteen loops. Two LPIB reads
++             * separated by 2.5-3.0 ms avoid that false apparent freeze.
++             *
++             * Workqueue process context: bounded sleep allowed; no new
++             * PCI/HDA/BDL register writes, interrupts or playback changes.
++             */
++            if (stream->bufsize) {
++                u32 before, after, wall_before, wall_after;
++                u32 lpib_delta, wall_delta, cbl = stream->bufsize;
++                u8 sd_before, sd_after;
++
++                wall_before = azx_readl(chip, WALLCLK);
++                before = snd_hdac_stream_readl(stream, SD_LPIB);
++                sd_before = snd_hdac_stream_readb(stream, SD_STS);
++                usleep_range(2500, 3000);
++                wall_after = azx_readl(chip, WALLCLK);
++                after = snd_hdac_stream_readl(stream, SD_LPIB);
++                sd_after = snd_hdac_stream_readb(stream, SD_STS);
++                lpib_delta = (after + cbl - before) % cbl;
++                wall_delta = wall_after - wall_before;
++
++                dev_info(&chip->pci->dev,
++                         "V76P sample=%u stream=4 lpib_before=%u lpib_after=%u lpib_delta_3ms=%u wallclk_delta=%u sd_before=%02x sd_after=%02x cbl=%u\n",
++                         sample, before, after, lpib_delta, wall_delta,
++                         sd_before, sd_after, cbl);
++            }
++        }
++        dev_info(&chip->pci->dev,
++                 "V71D sample=%u stream=%d running=%d ctl=%08x sts=%02x lpib=%u cbl=%u\n",
++                 sample, stream->index, stream->running,
++                 snd_hdac_stream_readl(stream, SD_CTL),
++                 snd_hdac_stream_readb(stream, SD_STS),
++                 snd_hdac_stream_readl(stream, SD_LPIB),
++                 snd_hdac_stream_readl(stream, SD_CBL));
++    }
++
++    /*
++     * V74 LIVE DIAG (explicitly opt-in): after >64 previously valid stream4
++     * completion interrupts, require 3 x 2s of zero new completions while
++     * stream4 DMA LPIB still advances. NEVER trigger before audio starts.
++     * Switch converter to existing legacy INTx once, without restarting or
++     * touching the PCM stream, to differentiate bridge vs HDA source failure.
++     */
++    if (ae7_tsi381_intx_fallback_diag && !hda->tsi381_v74_fallback_done) {
++        u64 s4_irq = atomic64_read(&hda->tsi381_irq_sd_complete);
++        u32 lpib = 0, previous_lpib = hda->tsi381_v74_last_lpib;
++        bool playing = false, dma_advanced;
++        u16 pci_status = 0xffff;
++        u8 sd_status = 0xff;
++
++        list_for_each_entry(stream, &bus->stream_list, list) {
++            if (stream->index == 4 && stream->running &&
++                stream->substream && stream->period_bytes) {
++                playing = true;
++                lpib = snd_hdac_stream_readl(stream, SD_LPIB);
++                sd_status = snd_hdac_stream_readb(stream, SD_STS);
++                break;
++            }
++        }
++
++        dma_advanced = playing && lpib != previous_lpib;
++        if (playing && s4_irq >= 64 && dma_advanced &&
++            s4_irq == hda->tsi381_v74_last_s4 &&
++            (intctl & (BIT(31) | BIT(4))) == (BIT(31) | BIT(4)) &&
++            !sd_status)
++            hda->tsi381_v74_noirq_samples++;
++        else
++            hda->tsi381_v74_noirq_samples = 0;
++
++        hda->tsi381_v74_last_s4 = s4_irq;
++        hda->tsi381_v74_last_lpib = lpib;
++
++        if (hda->tsi381_v74_noirq_samples >= 3) {
++            u32 confirm_ctrl;
++            int rc;
++            pci_read_config_word(chip->pci, PCI_STATUS, &pci_status);
++            dev_warn(&chip->pci->dev,
++                     "V74 MSI4_STALL: s4=%llu last_lpib=%u lpib=%u intsts=%08x intctl=%08x sd_sts=%02x pci_status=%04x bridge_ctrl=%08x mask=%08x pending=%08x\n",
++                     (unsigned long long)s4_irq,
++                     previous_lpib, lpib,
++                     intsts, intctl, sd_status, pci_status,
++                     ctrl, mask, pending);
++            hda->tsi381_v74_fallback_done = true;
++            if (rc_ctrl || rc_mask || ctrl != 1 || (mask & 0xff) != 0xef) {
++                dev_crit(&chip->pci->dev,
++                         "V74 FALLBACK_BLOCKED: Tsi381 state not expected; no writes\n");
++                goto v74_finish;
++            }
++            /*
++             * Preserve the existing IRQ38 handler at all times. Verify
++             * the converter is off BEFORE freeing MSI4 resources.
++             */
++            rc = pci_write_config_dword(bridge, AE7_TSI381_CTRL,
++                                        hda->tsi381_irq_ctrl_saved);
++            if (rc || pci_read_config_dword(bridge, AE7_TSI381_CTRL,
++                                            &confirm_ctrl) ||
++                confirm_ctrl != hda->tsi381_irq_ctrl_saved) {
++                dev_crit(&chip->pci->dev,
++                         "V74 FALLBACK_FAILED: bridge 0x220 restore unverified; MSI4 handler retained\n");
++                goto v74_finish;
++            }
++            dev_warn(&chip->pci->dev,
++                     "V74 FALLBACK_INTX_SWITCH_VERIFIED: control=0, existing IRQ=%u, same running DMA stream\n",
++                     hda->tsi381_legacy_irq);
++            /* release existing MSI resources, never an unsolicited reset */
++            ae7_tsi381_release_irq(chip);
++            dev_warn(&chip->pci->dev,
++                     "V74 FALLBACK_INTX_DONE: bridge MSI4 freed, legacy IRQ=%u retained\n",
++                     hda->tsi381_legacy_irq);
++            return;
++        }
++    }
++v74_finish:
++    if (sample < AE7_TSI381_DIAG_SAMPLES &&
++        READ_ONCE(hda->tsi381_diag_enabled))
++        schedule_delayed_work(&hda->tsi381_diag_work,
++                             msecs_to_jiffies(AE7_TSI381_DIAG_PERIOD_MS));
++}
++
++static void ae7_tsi381_release_irq(struct azx *chip)
++{
++    struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
++    struct hdac_bus *bus = azx_bus(chip);
++    struct pci_dev *bridge = hda->tsi381_bridge;
++    u32 readback;
++    int ret;
++
++    /* IRQ-fallback may happen independently of driver unload.
++     * Cancel pending telemetry without a synchronous wait in IRQ recovery.
++     */
++    WRITE_ONCE(hda->tsi381_diag_enabled, false);
++    cancel_delayed_work(&hda->tsi381_diag_work);
++    if (!bridge)
++        return;
++
++    /* Reconnect legacy INTx before the MSI handler is unregistered. */
++    ret = pci_write_config_dword(bridge, AE7_TSI381_CTRL,
++                                hda->tsi381_irq_ctrl_saved);
++    if (ret || pci_read_config_dword(bridge, AE7_TSI381_CTRL, &readback) ||
++        readback != hda->tsi381_irq_ctrl_saved)
++        dev_crit(chip->card->dev,
++                 "AE7/Tsi381: CRITICAL bridge INTx restore not verified\n");
++
++    bus->irq = hda->tsi381_legacy_irq;
++    chip->card->sync_irq = bus->irq;
++    free_irq(hda->tsi381_msi_irq, chip);
++    pci_free_irq_vectors(bridge);
++    pci_dev_put(bridge);
++    hda->tsi381_bridge = NULL;
++    dev_info(chip->card->dev,
++             "AE7/Tsi381: MSI4 released; legacy INTx IRQ %u retained\n",
++             hda->tsi381_legacy_irq);
++}
++
++
++/*
++ * Count HDA INTSTS at the MSI4 IRQ entry BEFORE the stock handler ACKs it.
++ * For performance the wrapper never writes or logs in hard IRQ context.
++ * IRQ return value is EXACTLY the original azx_interrupt() return value.
++ */
++static irqreturn_t ae7_tsi381_msi4_irq_observe(int irq, void *dev_id)
++{
++    struct azx *chip = dev_id;
++    struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
++    irqreturn_t result;
++
++    if (READ_ONCE(hda->tsi381_diag_enabled)) {
++        u32 intsts = azx_readl(chip, INTSTS);
++        struct hdac_bus *bus = azx_bus(chip);
++        struct hdac_stream *stream;
++
++        atomic64_inc(&hda->tsi381_irq_enter);
++        if (intsts & BIT(4))
++            atomic64_inc(&hda->tsi381_irq_intsts_s4);
++        if (intsts & AZX_INT_CTRL_EN)
++            atomic64_inc(&hda->tsi381_irq_intsts_ctrl);
++        if (!(intsts & (BIT(4) | AZX_INT_CTRL_EN)))
++            atomic64_inc(&hda->tsi381_irq_intsts_empty);
++
++        list_for_each_entry(stream, &bus->stream_list, list) {
++            if (stream->index != 4)
++                continue;
++            {
++                u8 sd = snd_hdac_stream_readb(stream, SD_STS);
++                if (sd & SD_INT_COMPLETE)
++                    atomic64_inc(&hda->tsi381_irq_sd_complete);
++                if (sd & (SD_INT_FIFO_ERR | SD_INT_DESC_ERR))
++                    atomic64_inc(&hda->tsi381_irq_sd_errors);
++            }
++            break;
++        }
++    }
++
++    result = azx_interrupt(irq, dev_id);
++    if (READ_ONCE(hda->tsi381_diag_enabled)) {
++        if (result == IRQ_HANDLED)
++            atomic64_inc(&hda->tsi381_irq_handled);
++        else
++            atomic64_inc(&hda->tsi381_irq_none);
++    }
++    return result;
++}
++
++static int ae7_tsi381_migrate_irq(struct azx *chip)
++{
++    struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
++    struct hdac_bus *bus = azx_bus(chip);
++    struct pci_dev *endpoint = chip->pci;
++    struct pci_dev *bridge = endpoint->bus->self;
++    u32 ctrl, gpio, mask, pending, readback, hda_status;
++    u16 msi_flags;
++    u8 pin;
++    unsigned int shift;
++    int irq, ret;
++
++    /* The early HDA codec negotiation MUST have finished on legacy INTx. */
++    if (!chip->running || !chip->card || !chip->card->registered ||
++        bus->irq < 0 || hda->tsi381_bridge)
++        return -EBUSY;
++
++    if (!bridge || pci_domain_nr(bridge->bus) != 0 ||
++        bridge->bus->number != 7 || bridge->devfn != PCI_DEVFN(0, 0) ||
++        bridge->vendor != 0x10e3 || bridge->device != 0x8111 ||
++        bridge->driver || !list_is_singular(&endpoint->bus->devices))
++        return -ENODEV;
++
++    ret = pci_read_config_byte(endpoint, PCI_INTERRUPT_PIN, &pin);
++    if (ret || pin != 1)
++        return -EINVAL;
++
++    ret = pci_read_config_dword(bridge, AE7_TSI381_GPIO_CTRL, &gpio);
++    if (ret)
++        return -EIO;
++    for (shift = 0; shift < 8; shift += 2)
++        if (((gpio >> shift) & 3) == 3)
++            return -EBUSY;
++
++    ret = pci_read_config_dword(bridge, AE7_TSI381_CTRL, &ctrl);
++    if (ret || ctrl)
++        return ret ? -EIO : -EBUSY;
++
++    bridge = pci_dev_get(bridge);
++    ret = pci_alloc_irq_vectors(bridge, AE7_TSI381_MSI_VECTORS,
++                                 AE7_TSI381_MSI_VECTORS, PCI_IRQ_MSI);
++    if (ret != AE7_TSI381_MSI_VECTORS) {
++        dev_err(chip->card->dev,
++                "AE7/Tsi381: exactly 8 MSI vectors required, got %d\n", ret);
++        if (ret > 0)
++            pci_free_irq_vectors(bridge);
++        if (ret >= 0)
++            ret = -ENOSPC;
++        goto fail_put;
++    }
++
++    ret = pci_read_config_word(bridge, AE7_TSI381_MSI_CONTROL, &msi_flags);
++    if (ret || ((msi_flags >> 4) & 7) != 3) {
++        dev_err(chip->card->dev,
++                "AE7/Tsi381: bridge MSI MME is not 8 vectors\n");
++        ret = -EIO;
++        goto fail_vectors;
++    }
++
++    irq = pci_irq_vector(bridge, AE7_TSI381_INTA_VECTOR);
++    if (irq <= 0) {
++        ret = irq < 0 ? irq : -EINVAL;
++        goto fail_vectors;
++    }
++    ret = request_irq(irq, ae7_tsi381_msi4_irq_observe, 0,
++                      chip->card->irq_descr, chip);
++    if (ret)
++        goto fail_vectors;
++
++    ret = pci_read_config_dword(bridge, AE7_TSI381_MSI_MASK, &mask);
++    if (ret || (mask & 0xff) != (0xff & ~BIT(AE7_TSI381_INTA_VECTOR))) {
++        dev_err(chip->card->dev,
++                "AE7/Tsi381: MSI4 remains masked, mask=0x%08x\n",
++                ret ? ~0U : mask);
++        ret = -EIO;
++        goto fail_msi_handler;
++    }
++    ret = pci_read_config_dword(bridge, AE7_TSI381_MSI_PENDING, &pending);
++    if (ret) {
++        ret = -EIO;
++        goto fail_msi_handler;
++    }
++    dev_info(chip->card->dev,
++             "AE7/Tsi381: MSI4 prepared IRQ=%d MME=8 mask=0x%08x pending=0x%08x\n",
++             irq, mask, pending);
++
++    /* Never switch modes while HDA already signals an outstanding IRQ. */
++    hda_status = azx_readl(chip, INTSTS);
++    if (hda_status) {
++        dev_err(chip->card->dev,
++                "AE7/Tsi381: pending/invalid HDA INTSTS=0x%08x, retain INTx\\n",
++                hda_status);
++        ret = -EBUSY;
++        goto fail_msi_handler;
++    }
++
++    /* Keep legacy IRQ registered, so an abnormal transition is reversible. */
++    ret = pci_write_config_dword(bridge, AE7_TSI381_CTRL, 1);
++    if (ret) {
++        ret = -EIO;
++        goto fail_msi_handler;
++    }
++    ret = pci_read_config_dword(bridge, AE7_TSI381_CTRL, &readback);
++    if (ret || readback != 1) {
++        ret = -EIO;
++        goto fail_restore_ctrl;
++    }
++
++    hda->tsi381_irq_ctrl_saved = ctrl;
++    hda->tsi381_legacy_irq = bus->irq;
++    hda->tsi381_msi_irq = irq;
++    hda->tsi381_bridge = bridge;
++    bus->irq = irq;
++    chip->card->sync_irq = irq;
++    dev_info(chip->card->dev,
++             "AE7/Tsi381: late MSI4 ACTIVE irq=%d legacy_irq=%u retained\n",
++             irq, hda->tsi381_legacy_irq);
++    return 0;
++
++fail_restore_ctrl:
++    if (pci_write_config_dword(bridge, AE7_TSI381_CTRL, ctrl))
++        dev_crit(chip->card->dev,
++                 "AE7/Tsi381: CRITICAL rollback write failed\n");
++fail_msi_handler:
++    free_irq(irq, chip);
++fail_vectors:
++    pci_free_irq_vectors(bridge);
++fail_put:
++    pci_dev_put(bridge);
++    return ret;
++}
++
+ static int azx_acquire_irq(struct azx *chip, int do_disconnect)
+ {
+ 	struct hdac_bus *bus = azx_bus(chip);
+@@ -1354,6 +1824,9 @@
+ 	if (hda->freed)
+ 		return;
+ 
++	WRITE_ONCE(hda->tsi381_diag_enabled, false);
++	cancel_delayed_work_sync(&hda->tsi381_diag_work);
++
+ 	if (azx_has_pm_runtime(chip) && chip->running) {
+ 		pm_runtime_get_noresume(&pci->dev);
+ 		pm_runtime_forbid(&pci->dev);
+@@ -1393,6 +1866,8 @@
+ 		azx_stop_chip(chip);
+ 	}
+ 
++	if (hda->tsi381_bridge)
++		ae7_tsi381_release_irq(chip);
+ 	if (bus->irq >= 0)
+ 		free_irq(bus->irq, (void*)chip);
+ 
+@@ -1800,6 +2275,8 @@
+ 	if (!hda)
+ 		return -ENOMEM;
+ 
++	/* Before every error/azx_free path. */
++	INIT_DELAYED_WORK(&hda->tsi381_diag_work, ae7_tsi381_diag_work);
+ 	chip = &hda->chip;
+ 	mutex_init(&chip->open_mutex);
+ 	chip->card = card;
+@@ -1830,6 +2307,21 @@
+ 	else
+ 		chip->bdl_pos_adj = bdl_pos_adj[dev];
+ 
++	/*
++	 * V73 one-variable experiment. Original AE-7 HDA INTx + all other
++	 * devices preserve stock settings. Change ONLY opt-in bridge AE7,
++	 * from the currently proven auto-selected 32 to 64. Never override
++	 * an explicitly configured user value.
++	 *
++	 * The BDL entries are constructed later using bus->bdl_pos_adj.
++	 */
++	if (ae7_tsi381_msi && ae7_tsi381_target(pci) &&
++	    bdl_pos_adj[dev] < 0 && chip->bdl_pos_adj == 32) {
++		chip->bdl_pos_adj = 64;
++		dev_info(&pci->dev,
++			 "V73 AE7: MSI4-only BDL position adjustment 32 -> 64 frames (experimental)\n");
++	}
++
+ 	err = azx_bus_init(chip, model[dev]);
+ 	if (err < 0)
+ 		return err;
+@@ -2088,8 +2580,16 @@
+ static int disable_msi_reset_irq(struct azx *chip)
+ {
+ 	struct hdac_bus *bus = azx_bus(chip);
++	struct hda_intel *hda = container_of(chip, struct hda_intel, chip);
+ 	int err;
+ 
++	if (hda->tsi381_bridge) {
++		dev_err(chip->card->dev,
++			"AE7/Tsi381: HDA IRQ recovery, reverting MSI4 to legacy INTx\n");
++		ae7_tsi381_release_irq(chip);
++		return 0; /* The original INTx handler remains installed. */
++	}
++
+ 	free_irq(bus->irq, chip);
+ 	bus->irq = -1;
+ 	chip->card->sync_irq = -1;
+@@ -2445,6 +2945,20 @@
+ 		pm_runtime_put_autosuspend(&pci->dev);
+ 	}
+ 
++	/* No early MSI conversion: the Creative codec must register over INTx. */
++	if (ae7_tsi381_msi && ae7_tsi381_target(pci)) {
++		int bridge_rc = ae7_tsi381_migrate_irq(chip);
++		if (bridge_rc) {
++			dev_err(chip->card->dev,
++				"AE7/Tsi381: MSI4 switch failed (%d), INTx retained\n",
++				bridge_rc);
++		} else {
++			WRITE_ONCE(hda->tsi381_diag_enabled, true);
++			schedule_delayed_work(&hda->tsi381_diag_work,
++				msecs_to_jiffies(AE7_TSI381_DIAG_PERIOD_MS));
++		}
++	}
++
+ out_free:
+ 	if (err < 0) {
+ 		pci_set_drvdata(pci, NULL);

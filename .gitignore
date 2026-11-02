@@ -1,0 +1,18 @@
+# Never publish private host files, signatures, or binaries
+*.ko
+*.ko.zst
+*.o
+*.der
+*.priv
+*.key
+*.pem
+*.p12
+*.pfx
+*.log
+*.deb
+*.tar.gz
+*.zip
+*.wav
+__pycache__/
+local/
+private/
