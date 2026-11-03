@@ -1,6 +1,8 @@
 # Sound Blaster AE-7 on Linux: Tsi381 MSI4 playback experiment
 
-**Status: working on one machine; experimental and NOT an upstream-ready or universal driver.**
+**Status: experimental; NOT stable across all playback sessions or system suspend, and NOT upstream-ready.**
+
+**Regression update (2026-11-03):** After S3 suspend, the Tsi381 MSI converter was found disabled even though V77 remained loaded. A later V78 short-playback test also lost HDA period-completion interrupts **while the MSI converter remained enabled** and DMA position continued to advance. V78 was rolled back to V77 and **is not installed**. The successful multi-hour music session remains a valid earlier observation, **not** proof of permanent stability. See the [November 3 regression investigation](docs/regressions-2026-11-03.md).
 
 On Kubuntu 26.10 (kernel `7.3.0-10-generic`), a Creative Sound Blaster AE-7 detected successfully with stock `snd_hda_intel` but analog stereo fell silent after a few seconds (~10–30 s), often recovering temporarily after codec reconfiguration. A custom HDA driver using bridge-generated **MSI vector 4**, an AE-7-specific **BDL position adjustment of 64** and an AE-7-only **PipeWire IRQ-scheduling rule** passed a 170-second audible test and then a separate installed 40-second test. The owner subsequently reported **several hours of normal music with no dropouts**.
 
